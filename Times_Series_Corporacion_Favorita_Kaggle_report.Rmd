@@ -1,0 +1,994 @@
+---
+title: 'Times Series - Corporacion Favorita Kaggle '
+output:
+  html_document: default
+  html_notebook: default
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+  word_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+# Introduction
+
+## PRESENTATION OF THE PROJECT ##
+
+The whole idea of our project was to add a time dimension to the data analysis process.
+
+We thought that finding a Kaggle competition would help us, mainly because it provides a framework for our project: 
+- data sets
+- clear objectives
+- evaluation of our scripts
+
+We spent some time on Kaggle to find the right competition and finally chose to work on the following competition:
+"Corporacion Favorita Grocery sales Forecasting"
+
+A quick overview of the competition (Kaggle description):
+
+"Brick-and-mortar grocery stores are always in a delicate dance with purchasing and sales forecasting. Predict a little over, and grocers are stuck with overstocked, perishable goods. Guess a little under, and popular items quickly sell out, leaving money on the table and customers fuming.
+
+The problem becomes more complex as retailers add new locations with unique needs, new products, ever transitioning seasonal tastes, and unpredictable product marketing. Corporación Favorita, a large Ecuadorian-based grocery retailer, knows this all too well. They operate hundreds of supermarkets, with over 200,000 different products on their shelves.
+
+Corporación Favorita has challenged the Kaggle community to build a model that more accurately forecasts product sales. They currently rely on subjective forecasting methods with very little data to back them up and very little automation to execute plans. They’re excited to see how machine learning could better ensure they please customers by having just enough of the right products at the right time."
+
+The whole point of the project was thus to make forecasts for all the items of the company for the last two weeks of August. We had a lot of disposable data:
+- the history of sales since january 2013
+- the history of transactions
+- data about items, stores, even holidays and oil prices (which have a great impact on the economy)
+
+We thought that, given the very short time period we had to work on this project, what we could do first was focus on some forecasting methods using times series, for different couples item-store, without taking into account the whole complexity of the data (geographic repartition of the stores, oil prices, types of items...)
+
+We are going to present more in detail the different data files that we have.
+A preprocessing of all this data and further information about is is presented in the "Preprocessing.Rmd" file
+
+## DATA PRESENTATION
+
+- File train.csv
+Training data, which includes the target unit_sales by date, store_nbr, and item_nbr and a unique id to label rows.
+
+- File test.csv
+Test data, with the date, store_nbr, item_nbr combinations that are to be predicted, along with the onpromotion information.
+
+- File stores.csv
+Store metadata, including city, state, type, and cluster.
+
+- File items.csv
+Item metadata, including family, class, and perishable.
+
+- File transactions.csv
+The count of sales transactions for each date, store_nbr combination. 
+
+- File oil.csv
+Daily oil price. Includes values during both the train and test data timeframe. (Ecuador is an oil-dependent country and it's economical health is highly vulnerable to shocks in oil prices.)
+
+- File holidays_events.csv
+Holidays and Events, with metadata
+
+## Technical tools
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(forecast)
+library(date)
+library(lubridate)
+library(leaflet)
+library(dplyr)
+```
+
+
+## DATA EXPLORATION
+
+First, we import the data from the training set.
+We only consider the top 10 selling items  in the year 2013.
+We decide to do so, as the original train file is way too big, computations are too long.
+We use the preprocessed file"train_best_sell" that contains these 10 items.
+
+```{r}
+train=fread("data/data/train_best_sell")
+```
+
+First analysis: let's take a look at our data
+
+```{r}
+head(train)
+summary(train)
+```
+
+
+## Sales Overview ##
+
+
+Let’s look at how the daily total unit sales (for the 10 items we selected) are distributed for all stores. 
+
+```{r}
+train[, .(total_sales = sum(unit_sales)/1000), by = date] %>%
+    ggplot(aes(x = total_sales)) + 
+    geom_histogram(fill = 'steelblue', bins = 50) + 
+    labs(x = 'Daily unit sales (000s)', title = 'Distribution of Daily Unit Sales - All Stores')
+```
+
+We can observe a unimodal distribution. A further analysis, taking into account the whole data, shows a bimodal distribution.
+
+
+## Sales over time ##
+
+Let’s take a look at the total unit sales over time, on a daily basis.
+
+We first convert the date feature into a Date.
+
+```{r}
+train[, date := as.Date(fast_strptime(date, format = "%Y-%m-%d"))]
+```
+
+
+
+# Daily Sales
+
+```{r}
+train[, .(total_sales = sum(unit_sales)), by = date][, .(date, total_sales)] %>% ggplot(aes(x=date,y=total_sales)) + geom_line() 
+labs(x = '', y = 'Total Unit Sales', 'Daily Unit Sales')
+```
+
+We see no clear trend in the data.
+When we take a look at the whole data, it is clear that there is an upward trend on the whole time period.
+
+As daily sales are rather noisy, we choose to plot also weekly and monthly sales.
+
+# Weekly Sales
+
+We add the week feature to our training set.
+```{r}
+# We add a week variable to our data
+train$week <- format(train$date, format="%Y-%U")
+```
+
+
+```{r}
+
+# We now plot weekly sales
+train[, .(total_sales = sum(unit_sales)), by = week][, .(week, total_sales)] %>% ggplot(aes(x=1:245,y=total_sales)) + geom_path() 
+labs(x = 'Weeks', y = 'Total Unit Sales', 'Weekly Unit Sales')
+```
+
+
+# Monthly Sales
+
+We add the month feature to our training set.
+```{r}
+#We add a month variable to our data
+train$month <- format(train$date, format="%Y-%m")
+
+```
+
+
+```{r}
+# We now plot monthly sales
+train[, .(total_sales = sum(unit_sales)), by = month][, .(month, total_sales)] %>% ggplot(aes(x=1:56,y=total_sales)) + geom_path() 
+labs(x = 'Months', y = 'Total Unit Sales', 'Monthly Unit Sales')
+```
+
+
+# Sales by stores
+
+Data import
+We import the "stores" file to have a quick overview of the localisation of the different stores in Ecuador.
+
+```{r}
+stores<-fread("data/data/stores.csv",header=TRUE)
+```
+
+We plot the cities where there is at least one Corporacion Favorita store, and plot circles, the size of which is proportional to the number of stores in the city.
+
+We use the leaflet package to do so.
+```{r}
+lat <-  c(-0.1807, -0.2389, 0.0367141, -0.9316, -1.6636, 0.3516889, -1.5905, -1.4924, -1.2543, -2.1710, -2.227827,
+          -1.8622, -1.8019, -1.0225, -2.6285, -2.2347644, -2.9001, -4.0079, -3.2581,  0.98333, -0.9677, -0.2714) 
+
+lng <- c(-78.4678, -79.1774, -78.1507, -78.6058, -78.6546, -78.1222, -78.9995, -78.0024, -78.6229, -79.9224, -80.9585,   
+         -79.9777, -79.5346, -79.4604, -80.3896, -80.9002, -79.0059, -79.2113, -79.9554, -79.65, -80.7089, -79.4648)
+
+stores[, .(num_stores = .N), by = city][, c('lat', 'lng') := list(lat, lng)] %>%
+    leaflet() %>% 
+    setView(lat = -0.900653, lng = -78.467834, zoom = 7) %>% 
+    addTiles() %>%
+    addCircleMarkers(
+        ~lng,
+        ~lat,
+        radius = ~ num_stores,
+        label = ~ city
+    )
+```
+
+
+## COUPLE ITEM-STORE ANALYSIS ##
+
+Let's try to focus on the forecast for one couple item_store.
+We choose to do so for: 
+- the item 1047679
+- the store 25
+
+(We chose the best selling item of the year 2013, and one representative store)
+```{r}
+#Let's convert our data into a time series
+train_ts_item <- train %>%  filter(store_nbr == 25) %>%
+  filter(item_nbr == 1047679)  %>% arrange(desc(date)) %>% select(unit_sales) %>%  head(100)
+
+#We use the ts function to convert our data set into a time series
+train_ts_item=ts(train_ts_item)
+```
+
+
+# I. Stationnarity analysis and ARIMA prediction
+
+To study the stationnarity and apply an ARIMA model on our data, we will use the package forecast. This package is very good to study univariate time series. 
+
+In this part, we will study our data as a univariate time series, that is to say we will not take care of all the features that characterize the number of unit sales but only this number itself. So, we study the number of unit sales as a series and the step is a day.
+
+```{r}
+library(xts)
+library(forecast)
+```
+
+## Preprocessing of the data
+
+For a start, we split the data in two sets: the train set and the test set composed by the 16 last days. Our goal is to predict for 16 days and we cannot use the test set provided because it does not give us the actual number of unit sales.
+
+```{r}
+train_prod_store <- read.csv("data/data/train_item103665_store25", header = TRUE, sep = " ")
+days_to_predict = 16 # we have to predict up to 16 days ahead
+data <- train_prod_store[,c(-1,-2)]  # can be replaced later (drop store nbr and item_nbr)
+data_ts <- xts(data, order.by=as.Date(row.names(data), "%Y-%m-%d"))
+  trainsize <-  dim(data_ts)[1]-16    # until which time step we will train
+  data_train_ts <- data_ts[1:trainsize,]
+  data_valid_ts <- data_ts[(trainsize+1):dim(data_ts)[1],]
+  data_valid_ts <- data_valid_ts[,1] # we only need unit_sales in the validation set
+```
+
+The train_unit_sales_xts is the train set and valid_unit_sales_ts is the valid number of sales for the test set. We convert them as ts because this is the class used by the package forecast.
+
+```{r}
+train_sales_xts <- data_train_ts[,1]
+train_sales_ts <- as.ts(train_sales_xts)
+valid_sales_xts <- data_valid_ts
+valid_sales_ts <- as.ts(valid_sales_xts)
+```
+
+## First impressions
+
+The first thing we can do is to plot the train time series to see if it is stationnary.
+A stationnary time series is a time series that has a pattern and not to much irregularities.
+
+```{r}
+plot.ts(train_sales_ts)
+```
+
+We can see that this time series has many irregularities from the peaks around n=750 and the period where it is constant zero around n=1300. Nevertheless, we can see a regularity that may be weekly.
+
+As for a global trend, the moving average seems to be constant. There is no particular trend for more or less sales.
+
+We will now plot a small part of the time series to look closer.
+
+```{r}
+plot.ts(train_sales_ts[0:50])
+```
+
+We can guess a weekly pattern (that is to say a period of 7). In fact, for n=5,12,19,26,33,40,47 there is a peak or at least the number of unit sales is pretty high. This pattern is a tendency but is not very clear and appears to suffer a lot of perturbations.
+
+## Remove outliers, inputing missing values and stabilize a strong growth trend
+
+One important and convenient function in the package forecast is tsclean(). This function allows to remove outliers and inputing missing values if there are some. Our dataset is pretty clean but we can still use it.
+
+```{r}
+train_sales_ts_clean=tsclean(train_sales_ts)
+ts.plot(train_sales_ts_clean)
+```
+
+The outliers have been lowered and the series seems to be much more stationary.
+
+The second thing to do tostabilize a growth trend is to use the log function on our time series. Here we will use log(Time series +1) because we have zeros. We also need to put the negative values to zeros.
+
+```{r}
+train_sales_ts_clean[train_sales_ts_clean<0]=0
+log_train_sales_ts_clean=log(train_sales_ts_clean+1)
+ts.plot(log_train_sales_ts_clean)
+```
+
+## Decomposition
+
+Another pratical way to analyze a time series is to use a seasonal decomposition which will decompose three aspects of the series: the trend, the seasonal and the residual.
+
+```{r}
+#decompose(train_sales_ts)
+```
+Error in decompose(train_sales_ts) : time series has no or less than 2 periods
+
+The problem here is that our time series have so much irregularities that it is impossible for the decompose() function to say that there is a period of 7 or another one. Our series seems not to be stationary.
+
+
+## Stationary test
+
+The most common stationary test is the Augmented Dickey-Fuller test with the null hypothesis that the series is non-stationnary. This test is in the package "tseries".
+
+```{r}
+library(tseries)
+adf.test(log_train_sales_ts_clean)
+```
+
+Suprisingly, the test rejects the null hypothesis of non-stationarity, that is to say we can not say that the series is non-stationary. In fact, the critical value of this test is around -3.5 and -8.2 is far from there.
+
+We can see all the paradox of real time series. Because of the multiple exogenous externalities and randomicity, even if a time series may be stationnary, it is impossible to determine a period. We can already see the problem of using a deterministic parametric model as ARIMA, which cannot take into account all the externalities.
+
+## ACF and PACF plots
+
+The good thing to study the stationarity of a series and determine the parameters of the ARIMA model is to plot the AutoCorrelation Function (ACF) and the Partial AutoCorrelation Function (PACF).
+
+The ACF studies the correlation between y(n) and y(n-h) showing the dependency of y(n) with the last results. The PACF studies the correlation between y(n) and y(n-h) after removing the linear correlation with all the y(n-k) for 0<k<h.
+
+A stationary time series with a period T will have only one peak for h=T. (and for h=k*T for ACF).
+
+```{r}
+acf(log_train_sales_ts_clean)
+pacf(log_train_sales_ts_clean)
+```
+
+The ACF graph shows that for all k > 0, there is an important dependency between y(n) and y(n-k). The simple explanation is that the time series is not enough differentiated. We then need to study the derivative of y(n) which can be approximate by y(n)-y(n-1).
+
+```{r}
+acf(diff(log_train_sales_ts_clean))
+pacf(diff(log_train_sales_ts_clean))
+```
+
+This time, in the ACF and PACF graphs the higher peaks are negative that is to say the time series is a bit too much differenciated but it is stille better than before.
+
+As predicted, we can conclude here that the time series seems to be stationary but the many irregularities seem to avoid having a good parametric model.
+
+We can look at the beginning of function, now that we tried to make it stationary.
+
+```{r}
+ts.plot(diff(log_train_sales_ts_clean)[0:50])
+```
+
+The ARIMA model can now be apply on this time series 
+
+## ARIMA model with different parameters
+
+ARIMA stands for auto-regressive integrated moving average and is specified by these three order parameters: (p, d, q).
+
+An auto regressive (AR(p)) component is referring to the use of past values in the regression equation for the series. The auto-regressive parameter p specifies the number of lags used in the model. For example, AR(2) or, equivalently, ARIMA(2,0,0), is represented as
+
+$$Y_t = c + \phi_1y_{t-1} + \phi_2 y_{t-2}+ e_t$$
+
+where ??1, ??2 are parameters for the model.
+
+To determine the parameter p, we just need to look at the PACF graph and take p= the last peak not in the blue interval. Here we can stand p=6.
+
+The d represents the degree of differencing in the integrated (I(d)) component. Differencing a series involves simply subtracting its current and previous values d times. We saw here that the optimal number of differenciation is d=1.
+
+A moving average (MA(q)) component represents the error of the model as a combination of previous error terms et. The order q determines the number of terms to include in the model
+
+$$Y_t = c + \theta_1 e_{t-1} + \theta_2 e_{t-2} +...+ \theta_q e_{t-q}+ e_t$$
+
+To determine the parameter q, we just need to look at the ACF graph and take q= the last peak not in the blue interval. Here we can stand q=1.
+
+Differencing, autoregressive, and moving average components make up a non-seasonal ARIMA model which can be written as a linear equation:
+
+$$ Y_t = c + \phi_1y_d{_{t-1}} + \phi_p y_d{_{t-p}}+...+\theta_1 e_{t-1} +  \theta_q e_{t-q} + e_t$$
+
+where yd is Y differenced d times and c is a constant.
+
+ARIMA models can be also specified through a seasonal structure. In this case, the model is specified by two sets of order parameters: (p, d, q) as described above and  $(P, D, Q)_m$ parameters describing the seasonal component of m periods.
+
+If we want to add a seasonal structure, we can take m=7 because of our intuition of the weekly trend as for the peak at k=7 in the PACF graph. We take P=0 (small peak in the ACF graph for k=7), Q=1 ( large peak in the PACF for k=7) and D=1 (because D=d).
+
+We then use the arima function to fit the model.
+
+```{r}
+start_time <- Sys.time()
+fit=arima(log_train_sales_ts_clean,order=c(6,1,1),seasonal=list(order=c(0,1,1),period=7))
+end_time <- Sys.time()
+summary(fit)
+print(end_time - start_time)
+```
+
+The processing time is very high (8.8 sec on my machine). This is because a parameter of p=6 is a lot and moreover we added a seasonal ARIMA.
+The statistical measure we can use to compare the effectiveness E of our algorithm with the log likelihood. Here , we have E=-1717.
+
+Then we can compare the prediction for the last 16 days with the valid unit sales
+
+```{r}
+pred= predict(fit, n.ahead= 16)
+plot(log(valid_sales_ts+1))
+lines(x=1:16, y=pred$pred,type='l', col='red')
+```
+
+We can see that the prediction capture the trend of those 16 days. On the first 6 days, the sales globaly increase, then globally from 6 to 9, they decrease. From 9 to 13, they increase and then decrase up to 16. However, the changes are totally underestimated and the day to day varitions are not take into account.
+
+We can also compute the measure given by the kaggle challenge
+
+```{r}
+NWRMSLE <- sqrt(sum((log(as.vector(valid_sales_ts)+1)-as.vector(pred$pred))^2)/length(as.vector(valid_sales_ts)))
+print(NWRMSLE)
+```
+
+Regarding the scores we will have after, the ARIMA model does not seem to be very good to predict that type of time series.
+
+ARIMA is a good way to give the tendency of the seasonal structure of a real time series but can not totally predict it (because of the externalities not taken into account). Combining with other methods, it can prove to be efficient.
+
+An interesting function in the forecast package is auto.arima() which evaluate by himself the parameters of the ARIMA model and apply it. To find the parameters it minimizes AIC value. The Akaike Information Critera (AIC) is a widely used measures that quantify both the goodness of fit and the simplicity. It is a good compromise between precision and quickness.
+
+```{r}
+start_time <- Sys.time()
+fit=auto.arima(log_train_sales_ts_clean, ic='aic')
+end_time <- Sys.time()
+summary(fit)
+print(end_time - start_time)
+```
+
+The processing time is far better (1.96) but the log likelihood is a bit lower. This is because the auto.arima() can only find a seasonal structure when this one is clear.
+
+```{r}
+pred= predict(fit, n.ahead= 16)
+plot(log(valid_sales_ts+1))
+lines(x=1:16, y=pred$pred,type='l', col='red')
+```
+
+The prediction here is quasi-constant because we don't have the weekly structure. The model is not capable of predict the future according to the past because of to many irregularities.
+
+```{r}
+NWRMSLE <- sqrt(sum((log(as.vector(valid_sales_ts)+1)-as.vector(pred$pred))^2)/length(as.vector(valid_sales_ts)))
+print(NWRMSLE)
+```
+
+The score is the same. 
+
+We can combine the parameters of the auto.arima with the seasonal structure we used at first.
+ 
+```{r}
+start_time <- Sys.time()
+fit=arima(log_train_sales_ts_clean,order=c(4,1,2),seasonal=list(order=c(0,1,1),period=7))
+end_time <- Sys.time()
+summary(fit)
+print(end_time - start_time)
+```
+
+We find pretty much the same processing time, log likehood and AIC than with our first analysis.
+
+```{r}
+pred= predict(fit, n.ahead= 16)
+plot(log(valid_sales_ts+1))
+lines(x=1:16, y=pred$pred,type='l', col='red')
+```
+
+The prediction is pratically the same. The advantage of using auto-arima is that we could automate the process for all stores and all items.
+
+Another interesting fact is that we can put some parameters to force auto.arima() to do more calculations to find the true best model.
+
+
+```{r}
+start_time <- Sys.time()
+fit=auto.arima(log_train_sales_ts_clean, ic='aic',stepwise=FALSE, approximation=FALSE)
+end_time <- Sys.time()
+summary(fit)
+print(end_time - start_time)
+```
+
+The processing time is important but the parameters found leads to a better log likelihood.
+We then combine it with our seasonal structure.
+
+```{r}
+start_time <- Sys.time()
+fit=arima(log_train_sales_ts_clean,order=c(2,1,3),seasonal=list(order=c(0,1,1),period=7))
+end_time <- Sys.time()
+summary(fit)
+print(end_time - start_time)
+```
+
+We see that this the best AIC that we have but the processing time is much higher (and not reasonable if we cumulate it with the auto.arima and if we want to calculate for all items and stores).
+
+## Comparaison with other stores
+
+All our analysis has been done on a specific item in a specific store. In this part, we will look at a change in store.
+
+```{r}
+train_prod_store_bis <- read.csv("data/data/train_item103665_store1", header = TRUE, sep = " ")
+days_to_predict = 16 # we have to predict up to 16 days ahead
+data <- train_prod_store_bis[,c(-1,-2)]  # can be replaced later (drop store nbr and item_nbr)
+data_ts <- xts(data, order.by=as.Date(row.names(data), "%Y-%m-%d"))
+  trainsize <-  dim(data_ts)[1]-16    # until which time step we will train
+  data_train_ts <- data_ts[1:trainsize,]
+  data_valid_ts <- data_ts[(trainsize+1):dim(data_ts)[1],]
+  data_valid_ts <- data_valid_ts[,1] # we only need unit_sales in the validation set
+train_sales_xts <- data_train_ts[,1]
+train_sales_ts <- as.ts(train_sales_xts)
+valid_sales_xts <- data_valid_ts
+valid_sales_ts <- as.ts(valid_sales_xts)
+train_sales_ts_clean=tsclean(train_sales_ts)
+train_sales_ts_clean[train_sales_ts_clean<0]=0
+log_train_sales_ts_clean=log(train_sales_ts_clean+1)
+start_time <- Sys.time()
+fit=auto.arima(log_train_sales_ts_clean, ic='aic')
+# fit['arma']=(p,q,P,Q,m,d,D)
+p=fit['arma']$arma[1]
+q=fit['arma']$arma[2]
+d=fit['arma']$arma[6]
+fit=arima(log_train_sales_ts_clean,order=c(q,d,p),seasonal=list(order=c(0,1,1),period=7))
+end_time <- Sys.time()
+summary(fit)
+print(end_time - start_time)
+pred= predict(fit, n.ahead= 16)
+plot(log(valid_sales_ts+1))
+lines(x=1:16, y=pred$pred,type='l', col='red')
+```
+
+```{r}
+NWRMSLE <- sqrt(sum((log(as.vector(valid_sales_ts)+1)-as.vector(pred$pred))^2)/length(as.vector(valid_sales_ts)))
+print(NWRMSLE)
+```
+
+```{r}
+train_prod_store_bis <- read.csv("data/data/train_item103665_store36", header = TRUE, sep = " ")
+days_to_predict = 16 # we have to predict up to 16 days ahead
+data <- train_prod_store_bis[,c(-1,-2)]  # can be replaced later (drop store nbr and item_nbr)
+data_ts <- xts(data, order.by=as.Date(row.names(data), "%Y-%m-%d"))
+  trainsize <-  dim(data_ts)[1]-16    # until which time step we will train
+  data_train_ts <- data_ts[1:trainsize,]
+  data_valid_ts <- data_ts[(trainsize+1):dim(data_ts)[1],]
+  data_valid_ts <- data_valid_ts[,1] # we only need unit_sales in the validation set
+train_sales_xts <- data_train_ts[,1]
+train_sales_ts <- as.ts(train_sales_xts)
+valid_sales_xts <- data_valid_ts
+valid_sales_ts <- as.ts(valid_sales_xts)
+train_sales_ts_clean=tsclean(train_sales_ts)
+train_sales_ts_clean[train_sales_ts_clean<0]=0
+log_train_sales_ts_clean=log(train_sales_ts_clean+1)
+start_time <- Sys.time()
+fit=auto.arima(log_train_sales_ts_clean, ic='aic')
+# fit['arma']=(p,q,P,Q,m,d,D)
+p=fit['arma']$arma[1]
+q=fit['arma']$arma[2]
+d=fit['arma']$arma[6]
+fit=arima(log_train_sales_ts_clean,order=c(q,d,p),seasonal=list(order=c(0,1,1),period=7))
+end_time <- Sys.time()
+summary(fit)
+print(end_time - start_time)
+pred= predict(fit, n.ahead= 16)
+plot(log(valid_sales_ts+1))
+lines(x=1:16, y=pred$pred,type='l', col='red')
+```
+
+```{r}
+NWRMSLE <- sqrt(sum((log(as.vector(valid_sales_ts)+1)-as.vector(pred$pred))^2)/length(as.vector(valid_sales_ts)))
+print(NWRMSLE)
+```
+
+We can see that approximately the same tendencies are predicted by this model which confirms the weekly structure is relevant. This also give us the certainty that the tendency is globally predicted by ARIMA model but the externalities explain the large gap between prediction and real.
+
+A more advanced model which takes into account the features given in the datasets are more likely to give a better prediction than the ARIMA model. 
+
+We can conclude by saying that the ARIMA model is good to give the global tendency of a series but can not give day to day predictions.
+
+# II. Analysis with VAR/VARX/VARMAX
+
+In this Analysis we want to make use of the features that have been computed in the Preprocessing step and try to apply a Vector Auto-Regression (VAR) model and some of its extensions to the data.
+
+In order to test this approach, it is applied to the preprocessed data files of all stores for item_nbr 103665. 
+
+In order to evaluate the performance of the algorithm, the NWRMSLE Error which is also used for the evaluation in the Kaggle Challenge is implimented. Since we only evaluate one product we can use the unweighted version. The function takes in data with two columns (prediction and validation set) and computes the Error between both.
+```{r}
+Analyse_predict <- function(compare_train_valid){
+  NWRMSLE <- sqrt(sum((log(compare_train_valid[,1]+1) - log(compare_train_valid[,2]+1))^2)/ dim(compare_train_valid)[1])
+}
+```
+
+
+The analysis requires some additional packages:
+```{r}
+library(data.table) 
+library(xts) # time series package
+library(astsa) # time series package
+library(vars) # package for time-series forecasting
+```
+
+## Store 25
+In the following we show the steps to compute the Error for Store nbr 25. 
+
+Load data: (the data predicted from Preprocessing.Rmd)
+```{r}
+  train_prod_store <- read.csv("data/data/train_item103665_store25", header = TRUE, sep = " ")
+  holiday_onprom <- read.csv("data/data/holiday_onprom_item103665_store25", header = TRUE, sep = " ")
+  days_to_predict = 16
+  data <- train_prod_store[,c(-1,-2)]  #drop store nbr and item_nbr
+```
+  
+We will predict 16 days, since this is the number of days that have to predicted in the KAGGLE Challenge.  
+```{r}
+  days_to_predict = 16
+```
+  
+  
+As a next step, one can choose which features to include:
+```{r}
+# e.g. just unit_sales and total_sales:
+ # data <- data[,1:2] 
+```          
+In the following, we will use all features for now.
+   
+  
+## Holiday
+
+We also want to include the holiday and onpromotion information. Therefore, we convert it to xts format. We also notice that we have some days which have two holidays for which we will delete the second value. We will combine different types of holiday for simplicity later on.   
+```{r}        
+  holiday_onprom_xts <- xts(holiday_onprom[,-1], order.by=as.Date(holiday_onprom$date, "%Y-%m-%d"))
+# we have some days with multiple holiday values, drop the second for each
+  holiday_onprom_xts2 <- holiday_onprom_xts[ ! duplicated( index(holiday_onprom_xts), fromLast = TRUE ),  ]
+``` 
+
+ 
+## Analysis
+
+The Analysis function applies the VAR method to the supplied preprocessed data set.
+The VAR method supplied from the vars package can also incorporate a seasonal trend as well as exogenous variables. As exogenous variables $D_t$ we will use the holiday data. Its influence is only at time step t.
+
+$$ y_t = c + A_1y_d{_{t-1}} + ... + A_p y_d{_{t-p}}+ C D_t + u_t$$
+
+
+We will split the data in a training set and a validation set. The validation set consists of the last 16 days of the data that we try to predict.
+We noticed that our product is never on promotion and therefore we will not use this input variable. 
+
+```{r}
+Analyse <- function(data){
+  # work in xts format for VAR prediction:
+  data_xts <- xts(data, order.by=as.Date(row.names(data), "%Y-%m-%d"))
+  
+# divide into train and valid set
+  trainsize <-  dim(data_xts)[1] - days_to_predict    # until which time step we will train
+  data_train_xts <- data_xts[1:trainsize,]
+  data_valid_xts <- data_xts[(trainsize+1):dim(data_xts)[1],]
+  data_valid_xts <- data_valid_xts[,1] # we only need unit_sales in the validation set
+
+  # get one factor with holiday 
+  holiday_onprom_xts3 <- holiday_onprom_xts2[,5]
+  holiday_onprom_xts3[holiday_onprom_xts3 == "None"] <- 0
+  holiday_onprom_xts3[holiday_onprom_xts3 == "Event"] <- 0
+  holiday_onprom_xts3[holiday_onprom_xts3 != "0" & holiday_onprom_xts3 != "2"] <- 1
+  holiday_onprom_xts4 <- as.xts(as.numeric(holiday_onprom_xts3), order.by = as.Date(row.names(data)))
+  holiday_onprom_xts3 <- as.numeric(holiday_onprom_xts3)
+  holid_train_xts <- holiday_onprom_xts3[1:trainsize]
+  holid_valid_xts <- holiday_onprom_xts4[(trainsize+1):dim(data_xts)[1]]
+  
+  assign("holid_train_xts", holid_train_xts, envir = .GlobalEnv) # some error in VAR cannot read holid_train_xts as a local variable
+
+# a method to predict the needed time steps for the VAR method
+  # u <- VARselect(data_train_xts, lag.max = 40, type = "const")
+  # it will not be used here inside the function. It gives multiple suggestions for p. depending on different criteria, in our case this gives us:
+  #  AIC(n)  HQ(n)  SC(n) FPE(n) 
+  #    8      8      2      8 
+  # These suggestions turned out to not be the optimal values for our error term. 
+  # Therefore, we will optimise over a certain range of p values:
+  # build a vector with error terms for different values of p
+  
+  NWRMSLE_var = c() 
+  pstart = 1
+  pend = 30
+  for (ptest in pstart:pend){
+# prediction with VAR
+  # use the vars package to analyse the data  with VAR and its predict function to predict future values:
+  data_var<-VAR(data_train_xts, p= ptest, type = "const", season = 7, exogen = data.frame(holid_train_xts) )
+  
+  data_var_forecast <- predict(data_var, n.ahead = days_to_predict, ci = 0.95, dumvar =  holid_valid_xts)
+  
+  # We can check the stability of the algorithm with roots. If we find a root that equal to one, we have an unstable process. This is not the case here
+  # roots(data_var)
+  # We get one root that is very close to one, which might show instability. This root can be avoided if we leave out the oil data set (data <- data[,-6]). This is expected since the oil data set is clearly unstable. On the other hand we do in fact get lower errors if we keep the oil data set. 
+
+# take out predicitons:  
+  data_var_pred <- data_var_forecast$fcst$unit_sales[,1]
+# set predictions that are negative to zero:
+  data_var_pred[data_var_pred < 0] <- 0
+# combine predictions and validation set  
+compare_train_valid_var <- cbind(data_valid_xts,data_var_pred)
+  
+   
+# compute ERROR values:
+  NWRMSLE_var <- rbind(NWRMSLE_var ,Analyse_predict(compare_train_valid_var))
+  NWRMSLE_var
+
+  }
+  # find the best p for the data:
+  bestchoice =  which.min(NWRMSLE_var)
+  bestchoice <- bestchoice + pstart -1
+ 
+  # # plot result for best p:
+  # best VAR fit:
+  data_var <- vars::VAR(data_train_xts, p=ptest, type="const", season = 7, exogen = data.frame(holid_train_xts))  # perform VAR analysis, include seasonal component
+  data_var_forecast <- predict(data_var, n.ahead = days_to_predict, ci = 0.95, dumvar =  holid_valid_xts)
+   data_var_pred <- data_var_forecast$fcst$unit_sales[,1]
+   # set predictions that are negative to zero:
+   data_var_pred[data_var_pred < 0] <- 0
+   compare_train_valid_var <- cbind(data_valid_xts,data_var_pred)  # combine predictions and validation set
+   
+   
+   
+   
+    p1 <- plot(compare_train_valid_var)
+      
+# Output -> result of Errors and the corresponding bestp
+   result <- list(errorplot=p1 , Error=min(NWRMSLE_var) , pbest= bestchoice)
+  return(result)
+}
+```
+
+Run the analysis for our data for store_nbr 25
+```{r}
+results <- Analyse(data)
+results
+```
+
+
+We can see that the p chosen here does not corresponds to the same p the VARselect function suggests. The plot shows that the predictions do find the second peak of unit_sales and it can be seen that they follow the trend of the data. At the days of the second peak we do in fact have a holiday which suggests that including an input variable brings a benefit.
+The Error value of 0.5143363 is very good compared to other competitors (0.503  is the best predicted error in the leaderboard). Of course, we will have different estimates for other items. And as we will see soon, other stores of have give higher error terms for the same product.
+
+
+Lastly, we want to analyse the performance throughout the other stores:
+```{r}
+item_nbr_1 = 103665
+NWRMSLE_var_stores = c()
+bestp_stores = c()
+  for(store_nbr_1 in 1:53){  # for every store:
+    # check if we have a file for that store nbr
+    if (length(which(list.files(path = "data") == paste('train_item',item_nbr_1, '_store', store_nbr_1, sep= "")))  > 0){
+      
+    train_prod_store <- read.csv(paste('data/train_item',item_nbr_1,'_store',store_nbr_1, sep= ""), header = TRUE, sep = " ")
+    holiday_onprom <- read.csv(paste('data/holiday_onprom_item',item_nbr_1,'_store',store_nbr_1, sep= ""), header = TRUE, sep = " ")
+    days_to_predict = 16 # we have to predict up to 16 days ahead
+    data <- train_prod_store[,c(-1,-2)]  # can be replaced later (drop store nbr and item_nbr)
+
+# for now to make it easier
+  #data <- data[,1:2] 
+    
+  holiday_onprom_xts <- xts(holiday_onprom[,-1], order.by=as.Date(holiday_onprom$date, "%Y-%m-%d"))
+# we have some days with multiple holiday values, drop the second for each
+  holiday_onprom_xts2 <- holiday_onprom_xts[ ! duplicated( index(holiday_onprom_xts), fromLast = TRUE ),  ]
+  Analysis_results= Analyse(data)
+  NWRMSLE_var_stores <- rbind( NWRMSLE_var_stores, Analysis_results$Error)
+  bestp_stores <- rbind( bestp_stores, Analysis_results$pbest)
+
+    }else{  # put in some values for stores that have no sales of the product
+        NWRMSLE_var_stores <- rbind( NWRMSLE_var_stores, 5)
+        bestp_stores <- rbind( bestp_stores, 0)
+
+    }
+  } 
+
+NWRMSLE_var_stores[is.na(NWRMSLE_var_stores)] <- 5 # Taking into account holidays if there are no holidays in the validation set leads to NA, take these out here
+NWRMSLE_var_average <- mean(NWRMSLE_var_stores[NWRMSLE_var_stores[,1] != 5])
+NWRMSLE_var_average
+bestp_stores
+```
+The average Error found for this specific item_nbr is 0.6307474. Therefore it is higher than for store 25. 
+The optimal p values differs a lot among the different stores.
+
+# III. Moving average by hand
+
+Dans cette partie on utilise les donn?es brutes. Il faut donc t?l?charger les donn?es sur la competition kaggle pour pouvoir reproduire l'analyse.
+
+```{r}
+#train <- fread("data/data/train.csv")
+gainpromotion <- function(item_nbr, store_nbr){
+  train1 <- train[train$store_nbr==store_nbr,] 
+  train1 <- train1[train1$item_nbr==item_nbr,] 
+  onp <- mean(train1[train1$onpromotion,4], na.rm = T)
+  offp <- mean(train1[!train1$onpromotion,4], na.rm=T)
+  k <- onp/offp
+  k
+}
+
+##determine the gain factor of the onpromotion boolean for a given item and store
+```
+
+
+```{r}
+library(data.table)
+
+train <- fread("data/data/train.csv", skip = 86672217, header = FALSE) # Skip dates before 2016-08-01
+setnames(train, c("id", "date", "store_nbr", "item_nbr", "unit_sales", "onpromotion"))
+#data_train <- data[1:trainsize,]
+#data_valid <- data[(trainsize+1):dim(data_ts)[1],]
+#data_valid <- data_valid[,1]
+test <- fread("data/data/test.csv")
+
+#======================================================================================================
+# clean up train
+
+
+# convert date to type date and insert field dow (day of week) via join
+dates <- data.table(date = seq.Date(as.Date("2013-01-01"), as.Date("2017-12-31"), by = "day"))
+dates[, `:=`(date_char = as.character(date), dow = weekdays(date))]
+setnames(train, "date", "date_char")
+setnames(test, "date", "date_char")
+train[dates, `:=`(date = i.date, dow = i.dow), on="date_char"]
+test[dates, `:=`(date = i.date, dow = i.dow), on="date_char"]
+train[, date_char := NULL]
+test[, date_char := NULL]
+
+# replace negatives with 0
+train[unit_sales < 0, unit_sales := 0]
+
+# log transform target: y := log(1 + y)
+train[, unit_sales := log1p(unit_sales)]
+
+##end of the preprocessing
+```
+
+
+```{r}
+NWRMSLE <- c()
+for (i in c(1047679, 265559, 314384, 364606, 502331, 559870, 584028, 807493, 819932, 839362)){
+itemn = i ##for testing best selling items, 103665 sinon
+storen = 25 ##for testing different store numbers
+train_prod_store <- train[train$store_nbr==storen,]
+train_prod_store <- train_prod_store[train_prod_store$item_nbr==itemn,]
+
+
+#On moyenne les valeurs quotidiennes et hebdomadaires
+ma_dw_prod_store <-  train_prod_store[!is.na(dow), list(madw = mean(unit_sales)), keyby=list(store_nbr, item_nbr, dow)]
+ma_wk_prod_store <- ma_dw_prod_store[, list(mawk = mean(madw)), keyby=list(store_nbr, item_nbr)]
+
+#definition de differentes fenetres pour tester differents cycles
+window_sizes <- c(1, 3, 7, 14, 28, 56, 112)
+
+#On definit la moyenne selon chacune de ces fenetres
+ma_prod_store <- list(train_prod_store[, list(window_size=226, avg = mean(unit_sales)), keyby = list(store_nbr, item_nbr)])
+##Date de debut de prediction 31/07/2017
+for(w in window_sizes){
+  ma_ps <- train_prod_store[date > as.Date("2017-07-31") - w, list(window_size = w, avg = mean(unit_sales)), keyby=list(store_nbr, item_nbr)]
+  ma_prod_store <- c(ma_prod_store, list(ma_ps))
+}
+
+
+ma_prod_store <- rbindlist(ma_prod_store)
+# On prend la mediane des valeurs obtenues pour plus de stabilite
+maisps <- median(ma_prod_store$avg)
+
+
+totest <- train_prod_store[(nrow(train_prod_store)-15):nrow(train_prod_store),]
+
+
+totest$mais = maisps
+totest[ma_dw_prod_store, madw := i.madw, on=c("store_nbr", "item_nbr", "dow")]
+totest[ma_wk_prod_store, mawk := i.mawk, on=c("store_nbr", "item_nbr")]
+
+#Phase de test/prediction
+real <- totest[, c(4,6)]
+#recuperation des données reelles
+
+
+# Prediction de  unit_sales
+totest[, unit_sales := mais, on=c("store_nbr", "item_nbr")] ##On prend la valeur médiane des differents moving averages pour plus de stabilité
+
+totest[mawk > 0, unit_sales := mais * madw / mawk]
+#critere d'evolution : si le moving average sur le semaine est positif strictement : on multiplie la valeur predite initiale (mediane des moving averages sur differents cycles typiques) par la moyenne du jour precedent divise par la moyenne sur la semaine (cycle de consommation typique - valeur etudiee precedemment comme cycle le plus representatif)
+
+
+
+#Prediction definie par les valeurs ci dessus 
+totest[is.na(unit_sales), unit_sales := 0]
+totest[, unit_sales := expm1(unit_sales)]
+real[, unit_sales:=expm1(unit_sales)]
+
+k <- gainpromotion(itemn, storen)
+if (is.na(k)){k <- log1p(1.5)}
+
+totest[onpromotion == T, unit_sales := unit_sales * expm1(k)]
+totest <- totest[, c(4,6)]
+plot(x=1:16,y=real$unit_sales, type='lines', col='red')+ lines(x=1:16,y=totest$unit_sales)
+NWRMSLE <- cbind(NWRMSLE, c(sqrt(sum((log(totest[,1]+1)-log(real[,1]+1))^2)/nrow(totest)))) 
+
+}
+##Methode simple obtenant de resultats generaux tres correct - critere NWRMSLE a 0.529, 1er du challenge a 0.503
+
+NWRMSLE
+
+
+
+
+
+```
+On s'apercoit que les donnees predisent souvent une bonne tendance de la consommation de produits, cependant les pics sont tres difficiles a apprehender (meme avec le critere onpromotion). Une bonne methode serait peut etre, pour approfondir, d'augmenter la variance de nos predictions.
+
+# IV. GARCH Model
+
+Dans cette partie, nous tenterons de compléter le modèle ARIMA de séries temporelles par un modèle GARCH. Notre étude s'effectuera sur le dataframe train_prod_store défini auparavant (pour un store number et un item number donnés).
+
+```{r}
+train_prod_store <- train[train$store_nbr==25,]
+train_prod_store <- train_prod_store[train_prod_store$item_nbr==584028,]
+
+train1 = train_prod_store[2:dim(train_prod_store)[1],"unit_sales"]
+train2 = train_prod_store[1:dim(train_prod_store)[1]-1,"unit_sales"]
+epsilon = log(train1/train2)
+head(epsilon)
+#epsilon$day = 1:(dim(train_prod_store)[1]-1)
+```
+On définit donc epsilon, rendement, afin de procéder à une étude selon la méthodologie GARCH vue en cours.
+
+```{r}
+n = dim(train_prod_store)[1]-1
+epsilon = ts(epsilon)
+```
+```{r}
+plot(epsilon) 
+```
+
+
+```{r}
+acf(epsilon)
+pacf(epsilon)
+```
+
+```{r}
+acf(epsilon*epsilon)
+pacf(epsilon*epsilon)
+```
+
+
+
+```{r}
+g <- garch(epsilon, order = c(1,1))
+plot(g)
+```
+
+```{r}
+epsilon_train=epsilon[1:(n-17)]
+epsilon_test = epsilon[(n-16):n]
+epsilon_test2 = epsilon[(n-15):n]
+
+```
+
+```{r}
+m1.mean.model <- auto.arima(epsilon_train, allowmean=F )
+ar.comp <- arimaorder(m1.mean.model)[1]
+ma.comp <- arimaorder(m1.mean.model)[3]
+```
+```{r}
+ar.comp
+ma.comp
+```
+
+```{r}
+library(rugarch)
+model.garch = ugarchspec(mean.model=list(armaOrder=c(ar.comp,ma.comp)),
+                         variance.model=list(garchOrder=c(1,20)),
+                         distribution.model = "std")
+model.garch.fit = ugarchfit(data=c(epsilon_train,epsilon_test), spec=model.garch, out.sample = length(epsilon_test),  solver = 'hybrid' )
+
+
+modelfor=ugarchforecast(model.garch.fit, data = NULL, n.ahead = 1, n.roll
+                        = length(epsilon_test), out.sample = length(epsilon_test))
+
+results1 <- modelfor@forecast$seriesFor[1,] + modelfor@forecast$sigmaFor[1,]
+results2 <- modelfor@forecast$seriesFor[1,] - modelfor@forecast$sigmaFor[1,]
+
+ylim <- c(min(epsilon_test), max(epsilon_test))
+
+
+plot(epsilon_test, col="blue", ylim=ylim)
+lines((modelfor@forecast$seriesFor[1,]),ylim=ylim)
+
+lines(epsilon_test, col="blue", ylim=ylim) # predicted process X_t (or mu_t)
+lines(results2, col="red", ylim=ylim) # predicted VaR_alpha
+lines((results1), col="red", ylim=ylim) # lower 95%-CI for VaR_alpha
+legend("bottomright", bty = "n", lty = rep(1, 6), lwd = 1.6,
+       col = c("blue","black","red"),
+       legend = c(expression(epsilon[t]), expression("Predicted"~epsilon[t]),
+                  substitute("95%-CI for"~epsilon[t])))
+
+```
+
+
+# Conclusion
+
+Ce challenge Kaggle fut un excellent moyen de passer en revue un grand panel de m?thode pour analyser les series temporelles. Une etude de la stationnarit? et un premier traitement des donnees permet d'obtenir des series plus facilement exploitable. Nous avons vu que des methodes parametriques mais ne prenant pas en compte les variables peuvent donner des tendances. Cependant, ils restent assez loin de la r?alit? car ils ne prennent pas en compte les externatites. Une technique de moyenne roulante faite ? la main permet d'obtenir de meilleures resultats. Enfin des techniques de machine learning plus poussees developpees en Python permettent une prediction raisonnable.
